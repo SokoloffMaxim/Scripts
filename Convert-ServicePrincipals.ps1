@@ -14,9 +14,7 @@
     - Ensure the script has access to the file path used for storing service connections:  
       i.e **`../data/service_connections.json`**. Note: this path can be modified if needed.
     The script fetches and writes service connection details to this file. Modify the path if necessary to suit your environment.
-    - Ensure the above folder does not contain file from the previous script run . i.e. service_connections_56be28a2-156c-41ee-9970-91a4eceaa43a.json , otherwise you will get message similar to this:
-    "Step 2: Processing Service Connections for Project: '{Project_Name}'...
-    [INFO] No service connections found for project '{Project_Name}'. Exiting..."
+    - Ensure the script runs with "-refreshServiceConnectionsIfTheyExist  $true" flag every new run if the old exported file still exists in the json path folder.
 
 .PARAMETER projectName
     (Optional) The name of the Azure DevOps project. If not provided, the script will prompt for it.
@@ -43,7 +41,8 @@
 
 .EXAMPLE
     # Revert Service Connections
-    .\Convert-ServicePrincipals3.ps1 -projectName "YourProjectName" -organizationUrl "https://dev.azure.com/YourOrganization" -isProductionRun $true -revertAll $true
+    .\Convert-ServicePrincipals3.ps1 -projectName "YourProjectName" -organizationUrl "https://dev.azure.com/YourOrganization" -isproduction $true -revertAll $true -refreshServiceConnectionsIfTheyExist  $true
+    Note: Order is important.
 
 .DEPENDENCIES
     - Azure CLI: Ensure the Azure CLI is installed and configured (`az login`).
@@ -272,8 +271,14 @@ function Get-ServiceConnections {
 
                             if ($hashTableAdoResources.ContainsKey("$($armServiceEndpoint.id)")) {
                                 Write-Warning "Service Connection $($armServiceEndpoint.id) already exists. Checking if it's shared."
+                            
                                 if (-not $armServiceEndpoint.isShared) {
-                                    throw "Conflict: endpointId $($armServiceEndpoint.id) exists but is not shared!"
+                                    if (-not $refreshServiceConnectionsIfTheyExist) {
+                                        throw "Conflict: endpointId $($armServiceEndpoint.id) exists but is not shared! Use -refreshServiceConnectionsIfTheyExist `$true` to update existing connections."
+                                    } else {
+                                        Write-Output "⚠️ Service Connection '$($armServiceEndpoint.id)' exists but is not shared. Updating..."
+                                        $hashTableAdoResources["$($armServiceEndpoint.id)"] = $projSvcEndpoint  # Update instead of error
+                                    }
                                 }
                             } else {
                                 $hashTableAdoResources.Add("$($armServiceEndpoint.id)", $projSvcEndpoint)
@@ -579,9 +584,9 @@ if ($exported) {
             continue
         }
 
-        # **Skip Service Connections Immediately if not using -revertAll $true and if authorization scheme already Service Principal**
-        if ($serviceConnection.authorization.scheme -eq "ServicePrincipal") {
-            Write-Output "⚠️ Skipping Service Connection '$($serviceConnection.name)' due to service connection using Service Principal authorization scheme."
+        # **Skip Service Connections if not using -revertAll $true and the authorization scheme is already Service Principal**
+        if ($revertAll -and $serviceConnection.authorization.scheme -eq "ServicePrincipal") {
+            Write-Output "⚠️ Skipping Service Connection '$($serviceConnection.name)' because it is already using Service Principal"
             continue
         }
 
