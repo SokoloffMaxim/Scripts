@@ -576,6 +576,10 @@ if ($exported) {
     # Filter service connections for the specified project
     $filteredEntries = $hashTableAdoResources.Values | Where-Object { $_.projectName -eq $projectName }
 
+    foreach ($entry in $filteredEntries) {
+        Write-Output "Found Service Connection in Project '$projectName' - Name: '$($entry.serviceEndpoint.name)'"
+    }
+
     if ($filteredEntries.Count -eq 0) {
         Write-Output "[INFO] No service connections found for project '$projectName'. Exiting..."
         return
@@ -585,6 +589,7 @@ if ($exported) {
         $serviceConnection = $entry.serviceEndpoint
         $organizationName = $entry.organizationName
         $organizationId = $entry.organizationId
+        $serviceConnectionName = $serviceConnection.name
 
         # Skip Service Connections if not using -revertAll $true and already Workload Identity Federation
         if (-not $revertAll -and $serviceConnection.authorization.scheme -eq "WorkloadIdentityFederation") {
