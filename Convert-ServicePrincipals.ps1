@@ -62,9 +62,6 @@
     - Refactored code for better readability and maintainability.
     - Added detailed script documentation, including a synopsis, description, parameters, examples, dependencies, and license information.
     - Documented the necessary Azure DevOps and Azure AD permissions required for execution.
-
-.LICENSE
-    This script is provided under the MIT License. Refer to the original repository for more details.
 #>
 
 # Define all parameters
@@ -140,31 +137,42 @@ function Get-AzureDevOpsOrganizationOverview {
 
 function Get-OrganizationId {
     param (
+        [Parameter(Mandatory = $true)]
         [string] $organizationName,
+        
+        [Parameter(Mandatory = $true)]
         [string] $tenantId
     )
+
     $outputFile = "organizations_${tenantId}.json"
-    $exists = Test-Path -Path $outputFile -PathType Leaf
-    if (-not $exists) {
-        Write-Output "File $outputFile not found..."
+
+    # Ensure the organizations file exists, fetch if missing
+    if (-not (Test-Path -Path $outputFile -PathType Leaf)) {
+        Write-Output "File '$outputFile' not found. Fetching organizations..."
         Get-AzureDevOpsOrganizationOverview -tenantId $tenantId
     }
-    $allOrganizationsJson = Get-Content -Path $outputFile 
-    $allOrganizations = $allOrganizationsJson | ConvertFrom-Json
 
-    $organizationFound = $allOrganizations | Where-Object { $_."Organization Name" -eq $organizationName }
-    
+    # Read and parse the JSON file
+    $allOrganizationsJson = Get-Content -Path $outputFile | ConvertFrom-Json
+
+    # Find organization by name
+    $organizationFound = $allOrganizationsJson | Where-Object { $_."Organization Name" -eq $organizationName }
+
     if ($organizationFound) {
-        Write-Output $organizationFound
-        $organizationId = $organizationFound[0]."Organization Id"
-        Write-Output "Organization $organizationName has id ${organizationId}"
-        return $organizationId
+        $organizationId = $organizationFound."Organization Id"
+
+        # Ensure that we return only the ID without printing unnecessary output
+        if ($organizationId) {
+            Write-Output "Successfully found Organization ID: $organizationId"
+            return $organizationId
+        }
     }
-    else {
-        Write-Warning "did not find org $organizationName in tenant $tenantId"
-        return ""
-    }
+
+    # Organization not found
+    Write-Warning "Organization '$organizationName' not found in tenant '$tenantId'."
+    return $null
 }
+
 
 function Get-Projects {
     param (
@@ -206,20 +214,17 @@ function Get-ServiceConnections {
         [string] $organizationUrl = $null
     )
 
-    #$exported = $false
-    $organizationsOutputFileExists = Test-Path -Path $organizationsOutputFile -PathType Leaf
-    if (-not $organizationsOutputFileExists) {
-        Write-Output "File $organizationsOutputFile not found... Fetching organizations."
+    # Ensure organization data is available
+    if (!(Test-Path $organizationsOutputFile)) {
+        Write-Output "File $organizationsOutputFile not found. Fetching organizations..."
         Get-AzureDevOpsOrganizationOverview -tenantId $tenantId
     }
-    $allOrganizationsJson = Get-Content -Path $organizationsOutputFile 
-    $allOrganizations = $allOrganizationsJson | ConvertFrom-Json
 
-    # Skip fetching service connections if the file exists and refresh is disabled
-    $serviceConnectionsOutputFileExists = Test-Path -Path $serviceConnectionJsonPath -PathType Leaf
-    $skipFetchingServiceConnections = $serviceConnectionsOutputFileExists -and (-not $refreshServiceConnectionsIfTheyExist)
+    # Load organization data
+    $allOrganizations = Get-Content -Path $organizationsOutputFile | ConvertFrom-Json
 
-    if ($skipFetchingServiceConnections) {
+    # Check if service connections should be skipped
+    if ((Test-Path $serviceConnectionJsonPath) -and (-not $refreshServiceConnectionsIfTheyExist)) {
         Write-Output "File $serviceConnectionJsonPath already exists. Skipping fetch."
         return $true
     }
@@ -231,102 +236,128 @@ function Get-ServiceConnections {
         $organizationId = $organization."Organization Id"
         $organizationUrl = $organization."Url"
 
-        if ($projectName) {
-            Write-Output "Fetching service connections for project '$projectName' in organization '$organizationName'..."
-            $projects = @(@{ name = $projectName })
-        } else {
-            Write-Output "Fetching all projects for organization '$organizationName'..."
-            $projects = Get-Projects -organizationUrl $organizationUrl
-        }
+        # Get project(s) for processing
+        $projects = if ($projectName) { @(@{ name = $projectName }) } else { Get-Projects -organizationUrl $organizationUrl }
 
         foreach ($project in $projects) {
             $currentProjectName = $project.name
-            Write-Output "Processing Org: ${organizationName}, Proj: ${currentProjectName}"
+            Write-Output "Fetching service connections for Org: ${organizationName}, Proj: ${currentProjectName}..."
 
             # Get service connections for the specific project
             $serviceEndpointsJson = az devops service-endpoint list --organization $organizationUrl --project $currentProjectName
-            $serviceEndpoints = $serviceEndpointsJson | ConvertFrom-Json -Depth 100            
+            $serviceEndpoints = $serviceEndpointsJson | ConvertFrom-Json -Depth 100
 
-            Write-Output "Found $($serviceEndpoints.Length) service endpoints for project $currentProjectName."
+            if (!$serviceEndpoints) {
+                Write-Output "No service endpoints found for project '$currentProjectName'."
+                continue
+            }
 
+            # Filter service connections by type (default: azurerm)
             $armServiceEndpoints = $serviceEndpoints | Where-Object { $_.type -eq $filterType }
 
-            # Ensure project name matches service connections
             foreach ($armServiceEndpoint in $armServiceEndpoints) {
+                $endpointId = $armServiceEndpoint.id
                 $endpointProjectRefs = $armServiceEndpoint.serviceEndpointProjectReferences
-                if ($endpointProjectRefs) {
-                    foreach ($ref in $endpointProjectRefs) {
-                        $refProjectName = $ref.projectReference.name
-                        if ($refProjectName -eq $currentProjectName) {
-                            $allServiceConnections += $armServiceEndpoint
 
-                            Write-Output "✅ Matched Service Connection: $($armServiceEndpoint.name) for project '$currentProjectName'"
+                # Validate endpoint references
+                if (!$endpointProjectRefs) {
+                    Write-Warning "Skipping Service Connection '$($armServiceEndpoint.name)' due to missing project reference."
+                    continue
+                }
 
-                            $projSvcEndpoint = @{
-                                "organizationName" = $organizationName
-                                "organizationId"   = $organizationId
-                                "projectName"      = $currentProjectName
-                                "serviceEndpoint"  = $armServiceEndpoint
-                            }
+                foreach ($ref in $endpointProjectRefs) {
+                    if ($ref.projectReference.name -eq $currentProjectName) {
+                        $allServiceConnections += $armServiceEndpoint
+                        Write-Output "Matched Service Connection: $($armServiceEndpoint.name) in '$currentProjectName'"
 
-                            if ($hashTableAdoResources.ContainsKey("$($armServiceEndpoint.id)")) {
-                                Write-Warning "Service Connection $($armServiceEndpoint.id) already exists. Checking if it's shared."
-                            
-                                if (-not $armServiceEndpoint.isShared) {
-                                    if (-not $refreshServiceConnectionsIfTheyExist) {
-                                        throw "Conflict: endpointId $($armServiceEndpoint.id) exists but is not shared! Use -refreshServiceConnectionsIfTheyExist `$true` to update existing connections."
-                                    } else {
-                                        Write-Output "⚠️ Service Connection '$($armServiceEndpoint.id)' exists but is not shared. Updating..."
-                                        $hashTableAdoResources["$($armServiceEndpoint.id)"] = $projSvcEndpoint  # Update instead of error
-                                    }
-                                }
-                            } else {
-                                $hashTableAdoResources.Add("$($armServiceEndpoint.id)", $projSvcEndpoint)
-                            }
+                        $projSvcEndpoint = @{
+                            "organizationName" = $organizationName
+                            "organizationId"   = $organizationId
+                            "projectName"      = $currentProjectName
+                            "serviceEndpoint"  = $armServiceEndpoint
                         }
+
+                        if ($hashTableAdoResources.ContainsKey($endpointId)) {
+                            Write-Warning "Service Connection $endpointId already exists. Checking if shared..."
+                            if (-not $armServiceEndpoint.isShared -and -not $refreshServiceConnectionsIfTheyExist) {
+                                throw "Conflict: endpointId $endpointId exists but is not shared! Use -refreshServiceConnectionsIfTheyExist `$true` to update."
+                            }
+                            Write-Output "Updating existing non-shared Service Connection: '$($armServiceEndpoint.name)'"
+                        }
+
+                        $hashTableAdoResources[$endpointId] = $projSvcEndpoint
                     }
                 }
             }
         }
     }
 
-    Write-Output "Saving service connections to $serviceConnectionJsonPath..."
-    $allServiceConnectionsJson = $allServiceConnections | ConvertTo-Json -Depth 100
-    Set-Content -Value $allServiceConnectionsJson -Path $serviceConnectionJsonPath
+    # Save results
+    if ($allServiceConnections.Count -gt 0) {
+        Write-Output "Saving service connections to $serviceConnectionJsonPath..."
+        $allServiceConnections | ConvertTo-Json -Depth 100 | Set-Content -Path $serviceConnectionJsonPath
+    } else {
+        Write-Warning "No service connections found to save."
+    }
 
     return $true
 }
 
-function New-FederatedCredential {
+
+function ConvertTo-WorkloadIdentityFederation {
     param (
-        [Parameter(mandatory = $true)]
+        [string] $body,
+        [string] $accessToken,
         [string] $organizationName,
-        [Parameter(mandatory = $true)]
-        [string] $projectName,
-        [Parameter(mandatory = $true)]
-        [string] $serviceConnectionName,
-        [Parameter(mandatory = $true)]
-        [string] $appObjectId,
-        [Parameter(mandatory = $true)]
+        [string] $organizationId,
         [string] $endpointId,
-        [Parameter(mandatory = $true)]
-        [string] $organizationId
+        [string] $serviceConnectionName,
+        [string] $appObjectId,
+        [string] $projectName
     )
-    $minifiedString = Get-Content .\credential.template.json | Out-String
-    $parametersJsonContent = (ConvertFrom-Json $minifiedString) | ConvertTo-Json -Depth 100 -Compress; # For PowerShell 7.3
 
-    #$issuer = "https://vstoken.dev.azure.com/${organizationId}"
-    $parametersJsonContent = $parametersJsonContent.Replace("__ENDPOINT_ID__", $endpointId)
-    $parametersJsonContent = $parametersJsonContent.Replace("__ORGANIZATION_NAME__", $organizationName)
-    $parametersJsonContent = $parametersJsonContent.Replace("__PROJECT_NAME__", $projectName)
-    $parametersJsonContent = $parametersJsonContent.Replace("__SERVICE_CONNECTION_NAME__", $serviceConnectionName)
-    $parametersJsonContent = $parametersJsonContent.Replace("__ORGANIZATION_ID__", $organizationId)
+    # Ensure required parameters are not empty
+    if (-not $organizationId -or $organizationId -eq "") {
+        Write-Error "ERROR: organizationId is missing. Cannot proceed."
+        return
+    }
+    if (-not $appObjectId -or $appObjectId -eq "") {
+        Write-Error "ERROR: appObjectId is missing. Ensure the service connection is linked to an App Registration."
+        return
+    }
 
-    Set-Content -Value $parametersJsonContent -Path .\credential.json
+    # API Request Headers
+    $headers = @{
+        "Content-Type"  = "application/json"
+        "Authorization" = "Bearer $accessToken"
+    }
 
-    $responseJson = az ad app federated-credential create --id $appObjectId --parameters credential.json
+    # API URI for converting authentication scheme
+    $uri = "https://dev.azure.com/${organizationName}/_apis/serviceendpoint/endpoints/${endpointId}?operation=ConvertAuthenticationScheme&api-version=7.1"
 
-    return $responseJson
+    # Debugging Output
+    Write-Output "INFO: Calling API to convert authentication scheme..."
+    Write-Output "API URL: $uri"
+    Write-Output "Request Body: $body"
+
+    try {
+        Write-Output "DEBUG: Sending JSON to Azure DevOps API..."
+        Write-Output $body
+        
+        # Convert Service Connection to Workload Identity Federation (WIF)
+        $response = Invoke-RestMethod -Uri $uri -Method 'PUT' -Headers $headers -Body $body
+
+        if ($response) {
+            Write-Output "API Request Succeeded. Service Connection converted to Workload Identity Federation."
+        } else {
+            Write-Warning "API Response is empty. Conversion might not have succeeded."
+            return $null
+        }
+    }
+    catch {
+        Write-Error "ERROR: API request failed - $_"
+        return $null
+    }
 }
 
 function PauseOn {
@@ -353,12 +384,16 @@ function Get-AzureAccessToken {
     return $accessToken
 }
 
-function ConvertTo-OrRevertFromWorkloadIdentityFederation {
+function Restore-WorkloadIdentityFederation {
     param (
         [string] $body,
         [string] $accessToken,
         [string] $organizationName,
-        [string] $endpointId
+        [string] $organizationId,
+        [string] $endpointId,
+        [string] $serviceConnectionName,
+        [string] $appObjectId,
+        [string] $projectName
     )
 
     # Headers for the REST API request
@@ -371,8 +406,8 @@ function ConvertTo-OrRevertFromWorkloadIdentityFederation {
     $uri = "https://dev.azure.com/${organizationName}/_apis/serviceendpoint/endpoints/${endpointId}?operation=ConvertAuthenticationScheme&api-version=7.1"
 
     # Debugging Information
-    Write-Output "DEBUG: Calling API at URL: $uri"
-    Write-Output "DEBUG: API Request Body: $body"
+    Write-Output "INFO: Calling API at URL: $uri"
+    Write-Output "INFO: API Request Body: $body"
 
     Try {
         # Perform API Request
@@ -380,36 +415,26 @@ function ConvertTo-OrRevertFromWorkloadIdentityFederation {
 
         # Debugging API Response
         if ($response) {
-            Write-Output "✅ API Request Succeeded. Response:"
+            Write-Output "API Request Succeeded. Response:"
             Write-Output ($response | ConvertTo-Json -Depth 10)
         } else {
-            Write-Warning "⚠️ API Response is empty. Conversion might not have succeeded."
+            Write-Warning "API Response is empty. Reversion might not have succeeded."
         }
 
         return $response
     }
     Catch {
         $errorMessage = $_.Exception.Message
-        Write-Error "❌ ERROR: API request failed - $errorMessage"
+        Write-Error "ERROR: API request failed - $errorMessage"
 
         if ($_.ErrorDetails -and $_.ErrorDetails.Message) {
             $detailedError = $_.ErrorDetails.Message
-            Write-Error "💡 Detailed API Error: $detailedError"
-
-            if ($detailedError.Contains("is neither an upgrade or a downgrade and is not supported")) {                
-                Write-Warning "⚠️ API Error: Invalid conversion detected."
-                return $null
-            }
-            elseif ($detailedError.Contains("Azure Stack environment")) {
-                Write-Warning "⚠️ Azure Stack environment issue detected."
-                return $null
-            }
+            Write-Error "Detailed API Error: $detailedError"
         }
 
         return $null  # Ensure that we return null in case of error
     }
 }
-
 
 function Get-Body {
     param (
@@ -440,35 +465,35 @@ function Get-Body {
     return $myBodyJson
 }
 
-
 function Get-AuthenticodeMode {
     param (
         [object] $serviceConnection
     )
-    $authorizationScheme = $($serviceConnection.authorization.scheme)
-    $creationMode = $($serviceConnection.data.creationMode)
 
-    if ($authorizationScheme -eq "WorkloadIdentityFederation") {
-        return "Workload Identity Federation ($creationMode)"
+    $authorizationScheme = $serviceConnection.authorization.scheme
+    $creationMode = $serviceConnection.data.creationMode
+
+    # Define mapping of schemes to human-readable formats
+    $authSchemeMap = @{
+        "WorkloadIdentityFederation" = "Workload Identity Federation"
+        "ServicePrincipal"           = "Service Principal"
+        "ManagedServiceIdentity"     = "Managed Identity"
+        "PublishProfile"             = "Publish Profile"
     }
-    elseif ($authorizationScheme -eq "ServicePrincipal") {
-        return "Service Principal ($creationMode)"
-    }
-    elseif ($authorizationScheme -eq "ManagedServiceIdentity") {
-        return "Managed Identity"
-    }
-    elseif ($authorizationScheme -eq "PublishProfile") {
-        return "Publish Profile"
+
+    # Retrieve the formatted name from the hash table or throw an error if not found
+    if ($authSchemeMap.ContainsKey($authorizationScheme)) {
+        return if ($creationMode) { "$($authSchemeMap[$authorizationScheme]) ($creationMode)" } else { $authSchemeMap[$authorizationScheme] }
     }
     else {
-        throw "Unexpected authorization scheme $authorizationScheme"
-        return $authorizationScheme
+        throw "Unexpected authorization scheme: $authorizationScheme"
     }
 }
 
+
 # Main script logic
 try {
-    # STEP 1: Login to Azure and Get Service Connections
+    # Login to Azure and Get Service Connections
     Write-Output 'Login to your Azure account using az login (use an account that has access to your Microsoft Entra ID) ...'
 
     az account clear
@@ -484,25 +509,46 @@ try {
     $currentTenantId = $($account.tenantId)
     Write-Output "Current Tenant ID: $currentTenantId"
 
-    Write-Output "Step 1: Get Service Connections using az devops CLI and export to JSON $serviceConnectionJsonPath ..."
+    Write-Output "Get Service Connections using az devops CLI and export to JSON $serviceConnectionJsonPath ..."
+    
+    # If the organization URL is not provided as an argument, ask the user
+    if (-not $organizationUrl) {
+        $organizationUrl = Read-Host "Please enter your Azure DevOps organization URL (e.g., https://dev.azure.com/your-organization)"
+    }
+    
+    # Extract Organization Name from URL
+    if ($organizationUrl -match "https://dev\.azure\.com/([^/]+)") {
+        $organizationName = $matches[1]
+        Write-Output "Organization name extracted from URL: $organizationName"
+    } else {
+        Write-Error "ERROR: Invalid organization URL. Expected format: https://dev.azure.com/your-organization"
+        exit 1
+    }
 
+    # Fetch the Organization ID using the extracted Organization Name
+    $organizationId = Get-OrganizationId -organizationName $organizationName -tenantId $currentTenantId
+
+    # Validate if the Organization ID is retrieved
+    if (-not $organizationId -or $organizationId -eq "") {
+        Write-Error "ERROR: Failed to retrieve Organization ID. Please check if the organization exists in Azure DevOps."
+        exit 1
+    }
+
+    Write-Output "Organization ID retrieved: $organizationId"
+    
     # If the project name is not provided as an argument, ask the user
     if (-not $projectName) {
         $projectName = Read-Host "Please enter the Azure DevOps project name"
     }
-
+    
     # Ensure the user does not enter an empty project name
     if (-not $projectName -or $projectName -match "^\s*$") {
         Write-Error "[ERROR] A project name is required. Exiting..."
         exit 1
     }
-
+    
     Write-Output "Using project name: $projectName"
-
-    # If the organization URL is not provided as an argument, ask the user
-    if (-not $organizationUrl) {
-        $organizationUrl = Read-Host "Please enter your Azure DevOps organization URL (e.g., https://dev.azure.com/your-organization)"
-    }
+    
 
     # Extract the organization name from the URL
     if ($organizationUrl -match "https://dev\.azure\.com/([^/]+)") {
@@ -560,10 +606,9 @@ $exported = Get-ServiceConnections -serviceConnectionJsonPath $serviceConnection
     -projectName $projectName `
     -organizationUrl $organizationUrl
 
-
 # Process service connections if they were successfully exported
 if ($exported) {
-    Write-Output "`nStep 2: Processing Service Connections for Project: '$projectName'..."
+    Write-Output "`nProcessing Service Connections for Project: '$projectName'..."
 
     # Filter service connections for the specified project
     $filteredEntries = $hashTableAdoResources.Values | Where-Object { $_.projectName -eq $projectName }
@@ -578,31 +623,28 @@ if ($exported) {
         $organizationName = $entry.organizationName
         $organizationId = $entry.organizationId
 
-        # **Skip Service Connections Immediately if not using -revertAll $true and if authorization scheme already WorkloadIdentity Federation**
+        # Skip Service Connections if not using -revertAll $true and already Workload Identity Federation
         if (-not $revertAll -and $serviceConnection.authorization.scheme -eq "WorkloadIdentityFederation") {
-            Write-Output "⚠️ Skipping Service Connection '$($serviceConnection.name)' due to due to service connection using Workload Identity Federation authorization scheme."
+            Write-Output "Skipping Service Connection '$serviceConnectionName' (already Workload Identity Federation)."
             continue
         }
 
-        # **Skip Service Connections if not using -revertAll $true and the authorization scheme is already Service Principal**
+        # Skip Service Connections if using -revertAll $true and already Service Principal
         if ($revertAll -and $serviceConnection.authorization.scheme -eq "ServicePrincipal") {
-            Write-Output "⚠️ Skipping Service Connection '$($serviceConnection.name)' because it is already using Service Principal"
+            Write-Output "Skipping Service Connection '$serviceConnectionName' (already using Service Principal)."
             continue
         }
 
-        # **Skip Shared Service Connections Immediately if User Chose "N"**
+        # Skip Shared Service Connections if User Chose "N"
         if ($serviceConnection.isShared -and $processSharedConnections -eq "N") {
-            Write-Output "⚠️  Skipping shared service connection: $($serviceConnection.name) (User chose not to process shared connections)"
-            continue  # Skip the rest of the loop iteration
+            Write-Output "Skipping shared service connection: '$serviceConnectionName' (per user request)."
+            continue
         }
 
         $counters.TotalArmServiceConnections++
 
-        # Determine Shared Status Icon (✅ for No, ⚠️ for Yes)
-        $isSharedIcon = if ($serviceConnection.isShared) { "⚠️  Yes" } else { "✅ No" }
-
         Write-Output "`n-----------------------"
-        Write-Output "Processing Service Connection: $($serviceConnection.name)"
+        Write-Output "Processing Service Connection: $serviceConnectionName"
 
         # Extract details
         $applicationRegistrationClientId = $serviceConnection.authorization.parameters.serviceprincipalid
@@ -610,41 +652,48 @@ if ($exported) {
         $authorizationScheme = $serviceConnection.authorization.scheme
         $endpointId = $serviceConnection.id
         $revertSchemeDeadline = $serviceConnection.data.revertSchemeDeadline
-        $creationMode = $serviceConnection.data.creationMode
 
-        # Time Calculation for Reverting
+        # Calculate Reversion Time Remaining
         $TimeSpan = if ($revertSchemeDeadline) { $revertSchemeDeadline - (Get-Date -AsUTC) } else { [timespan]::Zero }
         $totalDays = [math]::Round($TimeSpan.TotalDays, 2)
         $canRevert = $totalDays -gt 0
 
-        # Print service connection details with shared status
+        # Display service connection details
         Write-Output "App Registration Client Id   : $applicationRegistrationClientId"
         Write-Output "Tenant ID                    : $tenantId"
         Write-Output "Authorization Scheme         : $authorizationScheme"
-        Write-Output "Service Connection Name      : $serviceConnection.name"
+        Write-Output "Service Connection Name      : $serviceConnectionName"
         Write-Output "Endpoint ID                  : $endpointId"
         Write-Output "Revert Scheme Deadline       : $revertSchemeDeadline"
         Write-Output "Can Revert or Convert        : $canRevert"
         Write-Output "Total Days left to Revert    : $totalDays"
-        Write-Output "Shared Service Connection    : $isSharedIcon"
 
-        # Count Shared Service Connections (Only if User Allowed Processing)
-        if ($serviceConnection.isShared) {
-            Write-Warning "Shared Service Connection detected!"
-            $counters.SharedArmServiceConnections++
+        # Confirmation Prompt Before Processing
+        $confirmation = Read-Host "Proceed with processing Service Connection '$serviceConnectionName'? (Y/N)"
+        $confirmation = $confirmation.ToUpper()
+
+        while ($confirmation -notin @("Y", "N")) {
+            Write-Output "Invalid input. Please enter 'Y' to proceed or 'N' to skip."
+            $confirmation = Read-Host "Proceed with processing Service Connection '$serviceConnectionName'? (Y/N)"
+            $confirmation = $confirmation.ToUpper()
         }
 
-        # Extract the project references from the service connection
+        if ($confirmation -eq "N") {
+            Write-Output "Skipping Service Connection '$serviceConnectionName' as per user request."
+            continue
+        }
+
+        # Extract project references
         $projectReferences = $serviceConnection.serviceEndpointProjectReferences
 
         # Validate project references before proceeding
         if (-not $projectReferences -or $projectReferences.Count -eq 0) {
-            Write-Warning "⚠️ Skipping Service Connection '$($serviceConnection.name)' due to missing project reference."
+            Write-Warning "Skipping Service Connection '$serviceConnectionName' (missing project reference)."
             $counters.ArmServiceConnectionsNotConverted++
             continue
         }
 
-        # Determine if we need to revert or convert the service connection
+        # Determine whether to revert or convert
         $destinationAuthorizationScheme = switch ($authorizationScheme) {
             "ServicePrincipal"          { "WorkloadIdentityFederation" }
             "WorkloadIdentityFederation" { "ServicePrincipal" }
@@ -652,17 +701,17 @@ if ($exported) {
         }
 
         if (-not $destinationAuthorizationScheme) {
-            Write-Warning "⚠️ Skipping Service Connection '$($serviceConnection.name)' due to unrecognized authorization scheme."
+            Write-Warning "Skipping Service Connection '$serviceConnectionName' (unrecognized authorization scheme)."
             continue
         }
 
-        # Generate the new body with updated authorization scheme
+        # Generate new request body with updated authentication scheme
         $myNewBodyJson = Get-Body -id $endpointId -type $serviceConnection.type `
             -authorizationScheme $destinationAuthorizationScheme `
             -serviceEndpointProjectReferences $projectReferences
 
         if (-not $myNewBodyJson) {
-            Write-Warning "⚠️ Skipping Service Connection '$($serviceConnection.name)' due to failed body generation."
+            Write-Warning "Skipping Service Connection '$serviceConnectionName' (failed body generation)."
             continue
         }
 
@@ -673,40 +722,64 @@ if ($exported) {
             exit 1
         }
 
-        # Determine whether to revert or convert
+        # Revert to Service Principal (SP)
         if ($revertAll -and $authorizationScheme -eq "WorkloadIdentityFederation" -and $canRevert -and $isProductionRun) {
+            Write-Output "Reverting Service Connection '$serviceConnectionName' back to Service Principal..."
 
-            Write-Output "🔄 Reverting Service Connection '$($serviceConnection.name)' back to Service Principal..."
-            
-            # API Call to revert
-            $responseJson = ConvertTo-OrRevertFromWorkloadIdentityFederation `
+            # Call the Restore Function
+            $responseJson = Restore-WorkloadIdentityFederation `
                 -body $myNewBodyJson `
                 -organizationName $organizationName `
+                -organizationId $organizationId `
                 -endpointId $endpointId `
-                -accessToken $accessToken
+                -accessToken $accessToken `
+                -serviceConnectionName $serviceConnectionName `
+                -appObjectId $applicationRegistrationClientId `
+                -projectName $projectName
 
             if ($responseJson) {
-                Write-Output "✅ Successfully Reverted Service Connection: $($serviceConnection.name)"
+                Write-Output "Successfully Reverted Service Connection: $serviceConnectionName"
                 $counters.ArmServiceConnectionsReverted++
             } else {
-                Write-Warning "⚠️ Revert failed for Service Connection: $($serviceConnection.name)"
+                Write-Warning "Revert failed for Service Connection: $serviceConnectionName"
                 $counters.ArmServiceConnectionsNotReverted++
             }
-        } elseif ($authorizationScheme -eq "ServicePrincipal" -and $isProductionRun) {
-            Write-Output "🔄 Converting Service Connection '$($serviceConnection.name)' to Workload Identity Federation..."
-            
-            # API Call to convert
-            $responseJson = ConvertTo-OrRevertFromWorkloadIdentityFederation `
+        }
+
+        # Convert to Workload Identity Federation (WIF)
+        elseif ($authorizationScheme -eq "ServicePrincipal" -and $isProductionRun) {
+            # Validate Required Parameters Before Calling Function
+            if (-not $applicationRegistrationClientId -or $applicationRegistrationClientId -match "^\s*$") {
+                Write-Error "ERROR: Application Registration Client ID is missing. Cannot proceed."
+                exit 1
+            }
+
+            Write-Output "Converting Service Connection '$serviceConnectionName' to Workload Identity Federation..."
+            Write-Output "INFO: Calling ConvertTo-WorkloadIdentityFederation with:"
+            Write-Output "  ➤ Project Name: '$projectName'"
+            Write-Output "  ➤ Service Connection Name: '$serviceConnectionName'"
+            Write-Output "  ➤ Organization Name: '$organizationName'"
+            Write-Output "  ➤ Organization ID: '$organizationId'"
+            Write-Output "  ➤ Endpoint ID: '$endpointId'"
+            Write-Output "  ➤ App Registration Client ID: '$applicationRegistrationClientId'"
+
+            # Call the Convert Function
+            $responseJson = ConvertTo-WorkloadIdentityFederation `
                 -body $myNewBodyJson `
                 -organizationName $organizationName `
+                -organizationId $organizationId `
                 -endpointId $endpointId `
-                -accessToken $accessToken
+                -accessToken $accessToken `
+                -serviceConnectionName $serviceConnectionName `
+                -appObjectId $applicationRegistrationClientId `
+                -projectName $projectName
 
+            # Handle Response
             if ($responseJson) {
-                Write-Output "✅ Successfully Converted Service Connection: $($serviceConnection.name)"
+                Write-Output "Successfully Converted Service Connection: $serviceConnectionName"
                 $counters.ArmServiceConnectionsConverted++
             } else {
-                Write-Warning "⚠️ Conversion failed for Service Connection: $($serviceConnection.name)"
+                Write-Warning "Conversion failed for Service Connection: $serviceConnectionName"
                 $counters.ArmServiceConnectionsNotConverted++
             }
         }
@@ -714,7 +787,7 @@ if ($exported) {
         Write-Output "`n-----------------------"
     }
 
-    # Display Summary **(Moved Outside the Loop to Avoid Duplicates)**
+    # Display Summary
     Write-Output "`nSummary of Processed Service Connections:"
     Write-Output "----------------------------------------"
     foreach ($key in $counters.Keys | Sort-Object) {
