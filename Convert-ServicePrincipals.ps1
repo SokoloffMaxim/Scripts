@@ -178,27 +178,24 @@ function Get-Projects {
     param (
         [string] $organizationUrl
     )
-    # Get projects - Implement continuation token
+
+    $allProjects = @()
     $token = $null
-    $allProjects = @()  
 
     do {
-        if ($null -eq $token) {
-            $projectsRawJson = az devops project list --organization $organizationUrl
-        }
-        else {
-            $projectsRawJson = az devops project list --organization $organizationUrl --continuation-token $Token
+        $projectsRawJson = if ($token) {
+            az devops project list --organization $organizationUrl --continuation-token $token
+        } else {
+            az devops project list --organization $organizationUrl
         }
 
-        $projectsRaw = $projectsRawJson | ConvertFrom-Json -Depth $jsonDepth
-        $projects = $projectsRaw.value
+        $projectsRaw = $projectsRawJson | ConvertFrom-Json -Depth 10
+        $allProjects += $projectsRaw.value
         $token = $projectsRaw.ContinuationToken
-        
-        $allProjects += $projects
     }
     while ($null -ne $token)
 
-    return $projects
+    return $allProjects
 }
 
 function Get-ServiceConnections {
@@ -375,10 +372,10 @@ function Get-AzureAccessToken {
     param (
         [string] $resource = "499b84ac-1321-427f-aa17-267ca6975798" # Azure DevOps resource ID
     )
-    # Get the access token for Azure DevOps
+
     $accessToken = az account get-access-token --resource $resource --query accessToken -o tsv
     if (-not $accessToken) {
-        Write-Error "Failed to retrieve access token. Ensure you are logged in with 'az login'."
+        Write-Output "ERROR: Failed to retrieve access token. Ensure you are logged in with 'az login'."
         return $null
     }
     return $accessToken
@@ -494,76 +491,59 @@ function Get-AuthenticodeMode {
 # Main script logic
 try {
     # Login to Azure and Get Service Connections
-    Write-Output 'Login to your Azure account using az login (use an account that has access to your Microsoft Entra ID) ...'
+    Write-Output 'Logging into Azure... Please ensure you have the correct permissions.'
 
     az account clear
     $login = az login --only-show-errors
 
     if (!$login) {
-        Write-Error 'Error logging in and validating your credentials.'
-        return;
+        Write-Error 'Error logging in. Ensure your credentials are valid.'
+        exit 1
     }
 
-    $accountJson = az account show
-    $account = $accountJson | ConvertFrom-Json
-    $currentTenantId = $($account.tenantId)
+    # Retrieve Tenant ID
+    $accountJson = az account show | ConvertFrom-Json
+    $currentTenantId = $accountJson.tenantId
     Write-Output "Current Tenant ID: $currentTenantId"
 
-    Write-Output "Get Service Connections using az devops CLI and export to JSON $serviceConnectionJsonPath ..."
-    
-    # If the organization URL is not provided as an argument, ask the user
+    # Prompt for Organization URL if not provided
     if (-not $organizationUrl) {
-        $organizationUrl = Read-Host "Please enter your Azure DevOps organization URL (e.g., https://dev.azure.com/your-organization)"
+        $organizationUrl = Read-Host "Enter your Azure DevOps organization URL (e.g., https://dev.azure.com/your-organization)"
     }
-    
+
     # Extract Organization Name from URL
     if ($organizationUrl -match "https://dev\.azure\.com/([^/]+)") {
         $organizationName = $matches[1]
-        Write-Output "Organization name extracted from URL: $organizationName"
+        Write-Output "Using organization name: $organizationName"
     } else {
-        Write-Error "ERROR: Invalid organization URL. Expected format: https://dev.azure.com/your-organization"
+        Write-Error "ERROR: Invalid organization URL format. Expected format: https://dev.azure.com/your-organization"
         exit 1
     }
 
-    # Fetch the Organization ID using the extracted Organization Name
+    # Retrieve Organization ID
     $organizationId = Get-OrganizationId -organizationName $organizationName -tenantId $currentTenantId
-
-    # Validate if the Organization ID is retrieved
-    if (-not $organizationId -or $organizationId -eq "") {
-        Write-Error "ERROR: Failed to retrieve Organization ID. Please check if the organization exists in Azure DevOps."
+    if (-not $organizationId) {
+        Write-Error "ERROR: Failed to retrieve Organization ID. Ensure the organization exists in Azure DevOps."
         exit 1
     }
-
     Write-Output "Organization ID retrieved: $organizationId"
-    
-    # If the project name is not provided as an argument, ask the user
+
+    # Prompt for Project Name if not provided
     if (-not $projectName) {
-        $projectName = Read-Host "Please enter the Azure DevOps project name"
+        $projectName = Read-Host "Enter the Azure DevOps project name"
     }
-    
-    # Ensure the user does not enter an empty project name
-    if (-not $projectName -or $projectName -match "^\s*$") {
+
+    # Validate Project Name
+    if ([string]::IsNullOrWhiteSpace($projectName)) {
         Write-Error "[ERROR] A project name is required. Exiting..."
         exit 1
     }
-    
     Write-Output "Using project name: $projectName"
-    
 
-    # Extract the organization name from the URL
-    if ($organizationUrl -match "https://dev\.azure\.com/([^/]+)") {
-        $organizationName = $matches[1]  # Extract the organization name from the URL
-        Write-Output "Organization name extracted from URL: $organizationName"
-    } else {
-        Write-Error "Invalid organization URL. Please provide a URL in the format: https://dev.azure.com/your-organization"
-        exit 1
-    }
-
-    # Use the extracted organization name in the script
-    Write-Output "Using organization name: $organizationName"
-
+    # Define Service Connection JSON Path
     $serviceConnectionJsonPath = "../data/service_connections_${currentTenantId}.json"
-    
+
+    # Fetch Service Connections
     $exported = Get-ServiceConnections `
         -serviceConnectionJsonPath $serviceConnectionJsonPath `
         -refreshServiceConnectionsIfTheyExist $refreshServiceConnectionsIfTheyExist `
@@ -571,40 +551,23 @@ try {
         -projectName $projectName `
         -organizationUrl $organizationUrl
 
-    $hashTableAdoResourcesJson = $hashTableAdoResources | ConvertTo-Json -Depth $jsonDepth
-    Set-Content -Value $hashTableAdoResourcesJson -Path "hashTableAdoResources.json"
+    if (-not $exported) {
+        Write-Error "ERROR: Failed to retrieve service connections."
+        exit 1
+    }
 }
 catch {
-    Write-Error "An error occurred: $_"
-    throw
+    Write-Error "An unexpected error occurred: $_"
+    exit 1
 }
 
-# Ask the user if they want to process shared service connections
-$processSharedConnections = Read-Host "Do you want to process shared service connections? (Y/N)"
-
-# Convert the input to uppercase for case-insensitive comparison
-$processSharedConnections = $processSharedConnections.ToUpper()
-
-# Validate the user's input
-while ($processSharedConnections -notin @("Y", "N")) {
-    Write-Output "Invalid input. Please enter 'Y' for Yes or 'N' for No."
+# Prompt user for processing shared service connections
+do {
     $processSharedConnections = Read-Host "Do you want to process shared service connections? (Y/N)"
-    $processSharedConnections = $processSharedConnections.ToUpper()  # Convert to uppercase again
-}
+    $processSharedConnections = $processSharedConnections.ToUpper()
+} while ($processSharedConnections -notin @("Y", "N"))
 
-# Handle the user's choice
-if ($processSharedConnections -eq "N") {
-    Write-Output "Skipping shared service connections as per user request."
-} else {
-    Write-Output "Processing shared service connections."
-}
-
-# Call the function with the user-entered project name
-$exported = Get-ServiceConnections -serviceConnectionJsonPath $serviceConnectionJsonPath `
-    -refreshServiceConnectionsIfTheyExist $refreshServiceConnectionsIfTheyExist `
-    -tenantId $currentTenantId `
-    -projectName $projectName `
-    -organizationUrl $organizationUrl
+Write-Output ($processSharedConnections -eq "N" ? "Skipping shared service connections." : "Processing shared service connections.")
 
 # Process service connections if they were successfully exported
 if ($exported) {
@@ -652,8 +615,6 @@ if ($exported) {
         $authorizationScheme = $serviceConnection.authorization.scheme
         $endpointId = $serviceConnection.id
         $revertSchemeDeadline = $serviceConnection.data.revertSchemeDeadline
-
-        # Calculate Reversion Time Remaining
         $TimeSpan = if ($revertSchemeDeadline) { $revertSchemeDeadline - (Get-Date -AsUTC) } else { [timespan]::Zero }
         $totalDays = [math]::Round($TimeSpan.TotalDays, 2)
         $canRevert = $totalDays -gt 0
