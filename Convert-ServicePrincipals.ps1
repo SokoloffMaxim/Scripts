@@ -3,7 +3,8 @@
     Converts Azure DevOps service connections from Service Principal (SP) to Workload Identity Federation (WIF) or reverts them back to SP.
 
 .DESCRIPTION
-    This script automates the conversion of Azure DevOps service connections from Service Principal (SP) authentication to Workload Identity Federation (WIF), a modern, secure, and token-based authentication method. It also supports reverting service connections back to SP if needed. The script is designed to simplify identity management, reduce the risk of credential leakage, and enhance security in Azure DevOps environments.
+    This script automates the conversion of Azure DevOps service connections from Service Principal (SP) authentication to Workload Identity Federation (WIF), a modern, secure, and token-based authentication method. It also supports reverting service connections back to SP if needed. 
+    The script is designed to simplify identity management, reduce the risk of credential leakage, and enhance security in Azure DevOps environments.
 
     Based on the original implementation from:
     https://github.com/devopsabcs-engineering/azure-devops-workload-identity-federation/blob/main/scripts/Convert-ServicePrincipals.ps1
@@ -13,7 +14,7 @@
     - The **Application Administrator** role must be activated for the `_ca` Administrator account via **Privileged Identity Management (PIM)** to manage the service connections.
     - Ensure the script has access to the file path used for storing service connections:  
       i.e **`../data/service_connections.json`**. Note: this path can be modified if needed.
-    The script fetches and writes service connection details to this file. Modify the path if necessary to suit your environment.
+      The script fetches and writes service connection details to this file. Modify the path if necessary to suit your environment.
     - Ensure the script runs with "-refreshServiceConnectionsIfTheyExist  $true" flag every new run if the old exported file still exists in the json path folder.
 
 .PARAMETER projectName
@@ -23,7 +24,7 @@
     (Optional) The URL of the Azure DevOps organization. If not provided, the script will prompt for it.
 
 .PARAMETER isProductionRun
-    (Optional) Set to `$true` to perform actual conversions/reversions. Default is `$false`.
+    (Optional) Set to `$true` to perform actual conversions/reversions. Default is `$false` (dry-run mode).
 
 .PARAMETER revertAll
     (Optional) Set to `$true` to revert all service connections back to Service Principal (SP). Default is `$false`.
@@ -31,18 +32,37 @@
 .PARAMETER refreshServiceConnectionsIfTheyExist
     (Optional) Set to `$true` to refresh service connections even if they already exist. Default is `$false`.
 
-.EXAMPLE
-    # Convert Service Connections (Interactive Mode)
-    .\Convert-ServicePrincipals3.ps1 -isProductionRun $true
+.PARAMETER ConfirmProcessing
+    (Optional) Set to `$true` to prompt the user before processing each service connection. 
+    Set to `$false` to run without user confirmation. Default is `$true`.
+
+.PARAMETER ProcessSharedConnections
+    (Optional) Set to `$true` to process shared service connections. 
+    Set to `$false` to skip them. Default is `$true`.
 
 .EXAMPLE
-    # Convert Service Connections (Specify Project and Organization)
-    .\Convert-ServicePrincipals3.ps1 -projectName "YourProjectName" -organizationUrl "https://dev.azure.com/YourOrganization" -isProductionRun $true
+    # Convert Service Connections (Interactive Mode with Prompts)
+    .\Convert-ServicePrincipals.ps1 -isProductionRun $true
 
 .EXAMPLE
-    # Revert Service Connections
-    .\Convert-ServicePrincipals3.ps1 -projectName "YourProjectName" -organizationUrl "https://dev.azure.com/YourOrganization" -isproduction $true -revertAll $true -refreshServiceConnectionsIfTheyExist  $true
-    Note: Order is important.
+    # Convert Service Connections for a Specific Project and Organization (Non-Interactive)
+    .\Convert-ServicePrincipals.ps1 -projectName "YourProjectName" -organizationUrl "https://dev.azure.com/YourOrganization" -isProductionRun $true -ConfirmProcessing $false
+
+.EXAMPLE
+    # Revert All Service Connections to Service Principal (Non-Interactive)
+    .\Convert-ServicePrincipals.ps1 -projectName "YourProjectName" -organizationUrl "https://dev.azure.com/YourOrganization" -isProductionRun $true -revertAll $true -refreshServiceConnectionsIfTheyExist $true -ConfirmProcessing $false
+
+.EXAMPLE
+    # Skip Shared Service Connections but Run Fully Automated
+    .\Convert-ServicePrincipals.ps1 -projectName "YourProjectName" -organizationUrl "https://dev.azure.com/YourOrganization" -isProductionRun $true -ProcessSharedConnections $false -ConfirmProcessing $false
+
+.EXAMPLE
+    # Dry-Run Mode (No Actual Changes, Just Simulation)
+    .\Convert-ServicePrincipals.ps1 -projectName "YourProjectName" -organizationUrl "https://dev.azure.com/YourOrganization" -isProductionRun $false
+
+.EXAMPLE
+    # Convert Service Connections and Process Shared Connections Automatically
+    .\Convert-ServicePrincipals.ps1 -projectName "YourProjectName" -organizationUrl "https://dev.azure.com/YourOrganization" -isProductionRun $true -ProcessSharedConnections $true -ConfirmProcessing $false
 
 .DEPENDENCIES
     - Azure CLI: Ensure the Azure CLI is installed and configured (`az login`).
@@ -52,52 +72,64 @@
 .NOTES
     Original Source: https://github.com/devopsabcs-engineering/azure-devops-workload-identity-federation/blob/main/scripts/Convert-ServicePrincipals.ps1
 
-    Contributions, bug reports, and feedback are welcome! Please open an issue or submit a pull request on the original GitHub repository:
-    https://github.com/devopsabcs-engineering/azure-devops-workload-identity-federation
-
     MODIFICATIONS AND ADDITIONS:
     - Made `-projectName` and `-organizationUrl` optional. If not provided, the script will prompt the user to enter them.
     - Added improved error handling to ensure the user cannot proceed without providing a valid `projectName` or `organizationUrl`.
     - Enhanced user interaction with interactive prompts for missing inputs and clear error messages.
     - Refactored code for better readability and maintainability.
-    - Added detailed script documentation, including a synopsis, description, parameters, examples, dependencies, and license information.
+    - Added parameters for **automated execution** (`-ConfirmProcessing` and `-ProcessSharedConnections`).
+    - Included detailed examples showcasing **interactive and non-interactive** execution scenarios.
     - Documented the necessary Azure DevOps and Azure AD permissions required for execution.
+
 #>
 
 # Define all parameters
 param (
-    [string] $serviceConnectionJsonPath = "../data/service_connections.json",
-    [int]    $jsonDepth = 100,
+    [int]    $jsonDepth = 10,
     [bool]   $isProductionRun = $false,
     [bool]   $refreshServiceConnectionsIfTheyExist = $false,
     [string] $apiVersion = "7.1",
-    [bool]   $skipPauseAfterError = $false,
-    [bool]   $skipPauseAfterWarning = $false,
     [bool]   $revertAll = $false,
     [string] $projectName = $null,
-    [string] $organizationUrl = $null
+    [string] $organizationUrl = $null,
+    [bool]   $ConfirmProcessing = $false,
+    [bool]   $ProcessSharedConnections = $false
 )
 
 # Initialize counters and other global variables
 $counters = @{
-    TotalArmServiceConnections                                      = 0
+    # General tracking
+    TotalArmServiceConnections                = 0  # Total detected
+    ProcessedArmServiceConnections            = 0  # Successfully processed
+    SkippedArmServiceConnections              = 0  # Skipped due to various reasons
+
+    # Shared Service Connection tracking
+    SharedArmServiceConnections               = 0  # Number of shared service connections
+    SharedArmServiceConnectionsProcessed      = 0  # Shared connections actually processed
+
+    # Authentication type tracking
     ArmServiceConnectionsWithWorkloadIdentityFederationAutomatic    = 0
     ArmServiceConnectionsWithWorkloadIdentityFederationManual       = 0
     ArmServiceConnectionsWithServicePrincipalAutomatic              = 0
     ArmServiceConnectionsWithServicePrincipalManual                 = 0
     ArmServiceConnectionsWithManagedIdentity                        = 0
     ArmServiceConnectionsWithPublishProfile                         = 0
-    FederatedCredentialsCreatedManually                             = 0
-    SharedArmServiceConnections                                     = 0
-    ArmServiceConnectionsConverted                                  = 0
-    ArmServiceConnectionsNotConverted                               = 0
-    ArmServiceConnectionsReverted                                   = 0
-    ArmServiceConnectionsNotReverted                                = 0
+
+    # Federated Credentials tracking
+    FederatedCredentialsCreatedManually      = 0
+
+    # Conversion & Reversion tracking
+    ArmServiceConnectionsConverted           = 0  # Successful conversions
+    ArmServiceConnectionsNotConverted        = 0  # Failed conversions
+    ArmServiceConnectionsReverted            = 0  # Successful reversions
+    ArmServiceConnectionsNotReverted         = 0  # Failed reversions
 }
 
 $hashTableAdoResources = @{}
 
 # Define all functions at the top of the script
+
+# Retrieves an overview of Azure DevOps organizations linked to a given tenant.
 function Get-AzureDevOpsOrganizationOverview {
     [CmdletBinding()]
     param (
@@ -131,10 +163,11 @@ function Get-AzureDevOpsOrganizationOverview {
 
     $responseJson = $response | ConvertTo-Json -Depth $jsonDepth
 
-    $outputFile = "organizations_${tenantId}.json"
+    $outputFile = "../data/organizations_${tenantId}.json"
     Set-Content -Value $responseJson -Path $outputFile
 }
 
+# Fetches the Azure DevOps organization ID by its name.
 function Get-OrganizationId {
     param (
         [Parameter(Mandatory = $true)]
@@ -144,7 +177,7 @@ function Get-OrganizationId {
         [string] $tenantId
     )
 
-    $outputFile = "organizations_${tenantId}.json"
+    $outputFile = "../data/organizations_${tenantId}.json"
 
     # Ensure the organizations file exists, fetch if missing
     if (-not (Test-Path -Path $outputFile -PathType Leaf)) {
@@ -173,7 +206,7 @@ function Get-OrganizationId {
     return $null
 }
 
-
+# Retrieves a list of all projects under a given Azure DevOps organization.
 function Get-Projects {
     param (
         [string] $organizationUrl
@@ -189,7 +222,7 @@ function Get-Projects {
             az devops project list --organization $organizationUrl
         }
 
-        $projectsRaw = $projectsRawJson | ConvertFrom-Json -Depth 10
+        $projectsRaw = $projectsRawJson | ConvertFrom-Json -Depth $jsonDepth
         $allProjects += $projectsRaw.value
         $token = $projectsRaw.ContinuationToken
     }
@@ -198,6 +231,7 @@ function Get-Projects {
     return $allProjects
 }
 
+# Fetches all service connections for a given Azure DevOps project and organization.
 function Get-ServiceConnections {
     param (
         [Parameter(Mandatory = $true)]
@@ -242,7 +276,7 @@ function Get-ServiceConnections {
 
             # Get service connections for the specific project
             $serviceEndpointsJson = az devops service-endpoint list --organization $organizationUrl --project $currentProjectName
-            $serviceEndpoints = $serviceEndpointsJson | ConvertFrom-Json -Depth 100
+            $serviceEndpoints = $serviceEndpointsJson | ConvertFrom-Json -Depth $jsonDepth
 
             if (!$serviceEndpoints) {
                 Write-Output "No service endpoints found for project '$currentProjectName'."
@@ -292,7 +326,7 @@ function Get-ServiceConnections {
     # Save results
     if ($allServiceConnections.Count -gt 0) {
         Write-Output "Saving service connections to $serviceConnectionJsonPath..."
-        $allServiceConnections | ConvertTo-Json -Depth 100 | Set-Content -Path $serviceConnectionJsonPath
+        $allServiceConnections | ConvertTo-Json -Depth $jsonDepth | Set-Content -Path $serviceConnectionJsonPath
     } else {
         Write-Warning "No service connections found to save."
     }
@@ -300,7 +334,7 @@ function Get-ServiceConnections {
     return $true
 }
 
-
+# Converts a Service Principal-based service connection to Workload Identity Federation.
 function ConvertTo-WorkloadIdentityFederation {
     param (
         [string] $body,
@@ -357,17 +391,8 @@ function ConvertTo-WorkloadIdentityFederation {
     }
 }
 
-function PauseOn {
-    param (
-        [bool] $boolValue
-    )
-    if ($boolValue) {
-        Write-Output 'Press any key to continue...'
-        $null = $Host.UI.RawUI.ReadKey('NoEcho,IncludeKeyDown')
-        Write-Output ""
-    }
-}
 
+# Retrieves an Azure access token for interacting with Azure DevOps APIs.
 function Get-AzureAccessToken {
     param (
         [string] $resource = "499b84ac-1321-427f-aa17-267ca6975798" # Azure DevOps resource ID
@@ -381,6 +406,7 @@ function Get-AzureAccessToken {
     return $accessToken
 }
 
+# Reverts a Workload Identity Federation-based service connection back to Service Principal authentication.
 function Restore-WorkloadIdentityFederation {
     param (
         [string] $body,
@@ -402,7 +428,7 @@ function Restore-WorkloadIdentityFederation {
     # Construct API URI
     $uri = "https://dev.azure.com/${organizationName}/_apis/serviceendpoint/endpoints/${endpointId}?operation=ConvertAuthenticationScheme&api-version=7.1"
 
-    # Debugging Information
+    # Additional Information
     Write-Output "INFO: Calling API at URL: $uri"
     Write-Output "INFO: API Request Body: $body"
 
@@ -413,7 +439,7 @@ function Restore-WorkloadIdentityFederation {
         # Debugging API Response
         if ($response) {
             Write-Output "API Request Succeeded. Response:"
-            Write-Output ($response | ConvertTo-Json -Depth 10)
+            Write-Output ($response | ConvertTo-Json -Depth $jsonDepth)
         } else {
             Write-Warning "API Response is empty. Reversion might not have succeeded."
         }
@@ -433,6 +459,7 @@ function Restore-WorkloadIdentityFederation {
     }
 }
 
+# Constructs the JSON payload for API requests to update service connections.
 function Get-Body {
     param (
         [string] $id,
@@ -462,6 +489,7 @@ function Get-Body {
     return $myBodyJson
 }
 
+# This function retrieves a human-readable authentication scheme name for a given Azure DevOps service connection.
 function Get-AuthenticodeMode {
     param (
         [object] $serviceConnection
@@ -562,10 +590,11 @@ catch {
 }
 
 # Prompt user for processing shared service connections
-do {
-    $processSharedConnections = Read-Host "Do you want to process shared service connections? (Y/N)"
-    $processSharedConnections = $processSharedConnections.ToUpper()
-} while ($processSharedConnections -notin @("Y", "N"))
+if (-not $ProcessSharedConnections) {
+    Write-Output "Skipping shared service connections as per parameter setting."
+} else {
+    Write-Output "Processing shared service connections as per parameter setting."
+}
 
 Write-Output ($processSharedConnections -eq "N" ? "Skipping shared service connections." : "Processing shared service connections.")
 
@@ -573,43 +602,39 @@ Write-Output ($processSharedConnections -eq "N" ? "Skipping shared service conne
 if ($exported) {
     Write-Output "`nProcessing Service Connections for Project: '$projectName'..."
 
-    # Filter service connections for the specified project
-    $filteredEntries = $hashTableAdoResources.Values | Where-Object { $_.projectName -eq $projectName }
-
-    foreach ($entry in $filteredEntries) {
-        Write-Output "Found Service Connection in Project '$projectName' - Name: '$($entry.serviceEndpoint.name)'"
-    }
-
-    if ($filteredEntries.Count -eq 0) {
-        Write-Output "[INFO] No service connections found for project '$projectName'. Exiting..."
-        return
-    }
-
-    foreach ($entry in $filteredEntries) {
+    # Loop through all service connections in the project
+    foreach ($entry in $hashTableAdoResources.Values) {
         $serviceConnection = $entry.serviceEndpoint
         $organizationName = $entry.organizationName
         $organizationId = $entry.organizationId
         $serviceConnectionName = $serviceConnection.name
 
-        # Skip Service Connections if not using -revertAll $true and already Workload Identity Federation
-        if (-not $revertAll -and $serviceConnection.authorization.scheme -eq "WorkloadIdentityFederation") {
-            Write-Output "Skipping Service Connection '$serviceConnectionName' (already Workload Identity Federation)."
+        # Ensure isShared property exists before checking its value
+        $isShared = $false
+        if ($serviceConnection.PSObject.Properties.Name -contains "isShared") {
+            $isShared = $serviceConnection.isShared
+        }
+        $sharedStatus = if ($isShared) { "Yes" } else { "No" }
+
+        # Always count shared service connections, even if skipped
+        if ($isShared) {
+            $counters.SharedArmServiceConnections++
+        }
+
+        # Skip shared service connections if the user opted out
+        if ($isShared -and -not $ProcessSharedConnections) {
+            Write-Output "Skipping shared service connection: '$serviceConnectionName' as per user preference."
+            $counters.SkippedArmServiceConnections++
             continue
         }
 
-        # Skip Service Connections if using -revertAll $true and already Service Principal
-        if ($revertAll -and $serviceConnection.authorization.scheme -eq "ServicePrincipal") {
-            Write-Output "Skipping Service Connection '$serviceConnectionName' (already using Service Principal)."
-            continue
-        }
-
-        # Skip Shared Service Connections if User Chose "N"
-        if ($serviceConnection.isShared -and $processSharedConnections -eq "N") {
-            Write-Output "Skipping shared service connection: '$serviceConnectionName' (per user request)."
-            continue
-        }
-
+        # Increment total counter
         $counters.TotalArmServiceConnections++
+
+        # Only increment shared counter if we are processing shared connections
+        if ($isShared -and $ProcessSharedConnections) {
+            $counters.SharedArmServiceConnectionsProcessed++
+        }
 
         Write-Output "`n-----------------------"
         Write-Output "Processing Service Connection: $serviceConnectionName"
@@ -633,20 +658,18 @@ if ($exported) {
         Write-Output "Revert Scheme Deadline       : $revertSchemeDeadline"
         Write-Output "Can Revert or Convert        : $canRevert"
         Write-Output "Total Days left to Revert    : $totalDays"
+        Write-Output "Shared Status                : $sharedStatus"
 
-        # Confirmation Prompt Before Processing
-        $confirmation = Read-Host "Proceed with processing Service Connection '$serviceConnectionName'? (Y/N)"
-        $confirmation = $confirmation.ToUpper()
-
-        while ($confirmation -notin @("Y", "N")) {
-            Write-Output "Invalid input. Please enter 'Y' to proceed or 'N' to skip."
+        # Prompt for confirmation
+        if ($ConfirmProcessing) {
             $confirmation = Read-Host "Proceed with processing Service Connection '$serviceConnectionName'? (Y/N)"
-            $confirmation = $confirmation.ToUpper()
-        }
-
-        if ($confirmation -eq "N") {
-            Write-Output "Skipping Service Connection '$serviceConnectionName' as per user request."
-            continue
+            if ($confirmation.ToUpper() -ne "Y") {
+                Write-Output "Skipping Service Connection '$serviceConnectionName' as per user request."
+                $counters.SkippedArmServiceConnections++
+                continue
+            }
+        } else {
+            Write-Output "Automatically proceeding with Service Connection '$serviceConnectionName' as per parameter setting."
         }
 
         # Extract project references
@@ -655,7 +678,7 @@ if ($exported) {
         # Validate project references before proceeding
         if (-not $projectReferences -or $projectReferences.Count -eq 0) {
             Write-Warning "Skipping Service Connection '$serviceConnectionName' (missing project reference)."
-            $counters.ArmServiceConnectionsNotConverted++
+            $counters.SkippedArmServiceConnections++
             continue
         }
 
@@ -668,6 +691,7 @@ if ($exported) {
 
         if (-not $destinationAuthorizationScheme) {
             Write-Warning "Skipping Service Connection '$serviceConnectionName' (unrecognized authorization scheme)."
+            $counters.SkippedArmServiceConnections++
             continue
         }
 
@@ -678,6 +702,7 @@ if ($exported) {
 
         if (-not $myNewBodyJson) {
             Write-Warning "Skipping Service Connection '$serviceConnectionName' (failed body generation)."
+            $counters.SkippedArmServiceConnections++
             continue
         }
 
@@ -714,20 +739,7 @@ if ($exported) {
 
         # Convert to Workload Identity Federation (WIF)
         elseif ($authorizationScheme -eq "ServicePrincipal" -and $isProductionRun) {
-            # Validate Required Parameters Before Calling Function
-            if (-not $applicationRegistrationClientId -or $applicationRegistrationClientId -match "^\s*$") {
-                Write-Error "ERROR: Application Registration Client ID is missing. Cannot proceed."
-                exit 1
-            }
-
             Write-Output "Converting Service Connection '$serviceConnectionName' to Workload Identity Federation..."
-            Write-Output "INFO: Calling ConvertTo-WorkloadIdentityFederation with:"
-            Write-Output "  ➤ Project Name: '$projectName'"
-            Write-Output "  ➤ Service Connection Name: '$serviceConnectionName'"
-            Write-Output "  ➤ Organization Name: '$organizationName'"
-            Write-Output "  ➤ Organization ID: '$organizationId'"
-            Write-Output "  ➤ Endpoint ID: '$endpointId'"
-            Write-Output "  ➤ App Registration Client ID: '$applicationRegistrationClientId'"
 
             # Call the Convert Function
             $responseJson = ConvertTo-WorkloadIdentityFederation `
